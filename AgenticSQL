@@ -1,0 +1,322 @@
+import json
+from pathlib import Path
+from textwrap import dedent
+from typing import Optional
+
+from agno.agent import Agent
+from agno.knowledge.combined import CombinedKnowledgeBase
+from agno.knowledge.json import JSONKnowledgeBase
+from agno.knowledge.text import TextKnowledgeBase
+
+from agno.models.google import Gemini
+from agno.embedder.google import GeminiEmbedder
+from agno.storage.agent.postgres import PostgresAgentStorage
+from agno.tools.file import FileTools
+from agno.tools.reasoning import ReasoningTools
+from agno.tools.sql import SQLTools
+from agno.vectordb.pgvector import PgVector, SearchType
+
+
+# ************* Database Connection *************
+db_url = "postgresql+psycopg://ai:ai@localhost:5532/ai"
+# *******************************
+
+# ************* Paths *************
+cwd = Path(__file__).parent
+knowledge_dir = cwd.joinpath("knowledge")
+output_dir = cwd.joinpath("output")
+
+# Create the output directory if it does not exist
+output_dir.mkdir(parents=True, exist_ok=True)
+
+sql_agent_storage = PostgresAgentStorage(
+    db_url=db_url,
+    table_name="sql_agent_sessions",
+    schema="ai",
+)
+reasoning_sql_agent_storage = PostgresAgentStorage(
+    db_url=db_url,
+    table_name="reasoning_sql_agent_sessions",
+    schema="ai",
+)
+
+agent_knowledge = CombinedKnowledgeBase(
+    sources=[
+        # Reads text files, SQL files, and markdown files
+        TextKnowledgeBase(
+            path=knowledge_dir,
+            formats=[".txt", ".sql", ".md"],
+        ),
+        # Reads JSON files
+        JSONKnowledgeBase(path=knowledge_dir),
+    ],
+    # Store agent knowledge in the ai.sql_agent_knowledge table
+    vector_db=PgVector(
+        db_url=db_url,
+        table_name="sql_agent_knowledge",
+        search_type=SearchType.hybrid,
+        embedder=GeminiEmbedder(),
+    ),
+    # 5 references are added to the prompt
+    num_documents=5,
+)
+# *******************************
+semantic_model = {
+    "tables": [
+        {
+            "table_name": "constructors_championship",
+            "table_description": "Contains data for the constructor's championship from 1958 to 2020, capturing championship standings from when it was introduced.",
+            "Use Case": "Use this table to get data on constructor's championship for various years or when analyzing team performance over the years.",
+        },
+        {
+            "table_name": "drivers_championship",
+            "table_description": "Contains data for driver's championship standings from 1950-2020, detailing driver positions, teams, and points.",
+            "Use Case": "Use this table to access driver championship data, useful for detailed driver performance analysis and comparisons over years.",
+        },
+        {
+            "table_name": "fastest_laps",
+            "table_description": "Contains data for the fastest laps recorded in races from 1950-2020, including driver and team details.",
+            "Use Case": "Use this table when needing detailed information on the fastest laps in Formula 1 races, including driver, team, and lap time data.",
+        },
+        {
+            "table_name": "race_results",
+            "table_description": "Race data for each Formula 1 race from 1950-2020, including positions, drivers, teams, and points.",
+            "Use Case": "Use this table answer questions about a drivers career. Race data includes driver standings, teams, and performance.",
+        },
+        {
+            "table_name": "race_wins",
+            "table_description": "Documents race win data from 1950-2020, detailing venue, winner, team, and race duration.",
+            "Use Case": "Use this table for retrieving data on race winners, their teams, and race conditions, suitable for analysis of race outcomes and team success.",
+        },
+    ]
+}
+semantic_model_str = json.dumps(semantic_model, indent=2)
+
+description = dedent("""\
+    You are SQL, an elite Text2SQL Agent with access to a database with F1 data from 1950 to 2020.
+
+    You combine deep F1 knowledge with advanced SQL expertise to uncover insights from decades of racing data.
+""")
+
+instructions = dedent(f"""\
+    You are a SQL expert focused on writing precise, efficient queries.
+
+    When a user messages you, determine if you need query the database or can respond directly.
+    If you can respond directly, do so.
+
+    If you need to query the database to answer the user's question, follow these steps:
+    1. First identify the tables you need to query from the semantic model.
+    2. Then, ALWAYS use the `search_knowledge_base` tool to get table metadata, rules and sample queries.
+        - Note: You must use the `search_knowledge_base` tool to get table information and rules before writing a query.
+    3. If table rules are provided, ALWAYS follow them.
+    4. Then, "think" about query construction, don't rush this step. If sample queries are available, use them as a reference.
+    5. If you need more information about the table, use the `describe_table` tool.
+    6. Then, using all the information available, create one single syntactically correct PostgreSQL query to accomplish your task.
+    7. If you need to join tables, check the `semantic_model` for the relationships between the tables.
+        - If the `semantic_model` contains a relationship between tables, use that relationship to join the tables even if the column names are different.
+        - If you cannot find a relationship in the `semantic_model`, only join on the columns that have the same name and data type.
+        - If you cannot find a valid relationship, ask the user to provide the column name to join.
+    8. If you cannot find relevant tables, columns or relationships, stop and ask the user for more information.
+    9. Once you have a syntactically correct query, run it using the `run_sql_query` function.
+    10. When running a query:
+        - Do not add a `;` at the end of the query.
+        - Always provide a limit unless the user explicitly asks for all results.
+    11. After you run the query, "analyze" the results and return the answer in markdown format.
+    12. You Analysis should Reason about the results of the query, whether they make sense, whether they are complete, whether they are correct, could there be any data quality issues, etc.
+    13. It is really important that you "analyze" and "validate" the results of the query.
+    14. If the output contains only a single row output a natural language information
+    15. If the output is a table just say "Here is the requested data:"
+    16. Try to retain meaninful column names when you create the query, such that the output of the query has proper headers
+    17. For categorical values the user gives, make sure you try fuzzy matches, play with upper and lower case, with wild card operators if it results in empty output
+    18. Do not limit the output always show all outputs unless explicitly mentioned
+
+    
+
+    After finishing your task, ask the user relevant followup questions like "was the result okay, would you like me to fix any problems?"
+    If the user says yes, get the previous query using the `get_tool_call_history(num_calls=3)` function and fix the problems.
+    If the user wants to see the SQL, get it using the `get_tool_call_history(num_calls=3)` function.
+
+    Finally, here are the set of rules that you MUST follow:
+
+    <rules>
+    - Always use the `search_knowledge_base()` tool to get table information from your knowledge base before writing a query.
+    - Do not use phrases like "based on the information provided" or "from the knowledge base".
+    - Always show the SQL queries you use to get the answer.
+    - Make sure your query accounts for duplicate records.
+    - Make sure your query accounts for null values.
+    - If you run a query, explain why you ran it.
+    - Always derive your answer from the data and the query.
+    - **NEVER, EVER RUN CODE TO DELETE DATA OR ABUSE THE LOCAL SYSTEM**
+    - ALWAYS FOLLOW THE `table rules` if provided. NEVER IGNORE THEM.
+    </rules>
+""")
+
+additional_context = (
+    dedent("""\n
+    The `semantic_model` contains information about tables and the relationships between them.
+    If the users asks about the tables you have access to, simply share the table names from the `semantic_model`.
+    <semantic_model>
+    """)
+    + semantic_model_str
+    + dedent("""
+    </semantic_model>\
+""")
+)
+
+reasoning = True
+
+SQL_AGENT = Agent(
+    model=Gemini(id="gemini-2.0-flash"),
+    tools=[
+        SQLTools(db_url=db_url, list_tables=False),
+        FileTools(base_dir=output_dir),
+        ReasoningTools(add_instructions=True, add_few_shot=False),
+    ],
+    storage=reasoning_sql_agent_storage if reasoning else sql_agent_storage,
+    name="SQL_Agent",
+    user_id="default",
+    agent_id="SQL_Agent",
+    session_id="abcd-efgh-ijkl",
+    knowledge=agent_knowledge,
+    description=description,
+    instructions=instructions,
+    additional_context=additional_context,
+    search_knowledge=True,
+    read_chat_history=True,
+    read_tool_call_history=True,
+    add_history_to_messages=True,
+    add_datetime_to_instructions=True,
+    show_tool_calls=True
+)
+
+# SQL_AGENT.print_response("Who are the top drivers?", session_id="session-3")
+
+# while True:
+#     user_input = input("Enter your question (type 'exit' to quit): ")
+#     if user_input.lower() == 'exit':
+#         print("Goodbye!")
+#         break
+#     SQL_AGENT.print_response(user_input, session_id="session-3")
+
+from typing import Iterator
+from agno.workflow import Workflow, RunResponse
+from agno.utils.log import logger
+from agno.utils.pprint import pprint_run_response
+
+
+def run_workflow(user_question: str) -> str:
+    """
+    Execute SQL query using the SQL_AGENT and return the final response.
+    
+    Args:
+        user_question: The user's SQL question
+        
+    Returns:
+        str: The agent's final response
+    """
+    # Execute the SQL agent with the user question (non-streaming to get complete response)
+    # response = SQL_AGENT.run(user_question, stream=False, session_id="main-session-24")
+    # # SQL_AGENT.run
+    # print(f"This is the response: {response}")
+    # # Return the final response content
+    # return response.content
+
+    
+def run_workflow(user_question: str) -> str:
+    """
+    Execute SQL query using the SQL_AGENT and return the final response.
+    
+    Args:
+        user_question: The user's SQL question
+        
+    Returns:
+        str: The agent's final response
+    """
+    # Execute the SQL agent with the user question (non-streaming to get complete response)
+    # response = SQL_AGENT.run(user_question, stream=False, session_id="main-session-24")
+    # # SQL_AGENT.run
+    # print(f"This is the response: {response}")
+    # # Return the final response content
+    # return response.content
+    
+    # Get the response object to access tool calls
+    response = SQL_AGENT.run(user_question, stream=False, session_id="deep-session-5")
+
+    print(f"Input tokens: {response.metrics['input_tokens']}")
+    print(f"Output tokens: {response.metrics['output_tokens']}")
+    print(f"Total tokens: {response.metrics['total_tokens']}")
+
+    # Or print all metrics at once
+    from rich.pretty import pprint
+    print("=== Run Metrics ===")
+    pprint(response.metrics)
+    
+    if response.messages:
+        for i, message in enumerate(response.messages):
+            if message.role == "assistant":
+                print(f"Assistant message {i+1}:")
+                print(f"  Input tokens: {getattr(message.metrics, 'input_tokens', 0)}")
+                print(f"  Output tokens: {getattr(message.metrics, 'output_tokens', 0)}")
+                print(f"  Total tokens: {getattr(message.metrics, 'total_tokens', 0)}")
+    
+    # SQL_AGENT.session_state()
+    
+    
+    # Write code to print the SQL QUery and output of the query which gets executed if any
+    tool_calls = response.tools
+    for elem in reversed(tool_calls):
+        if elem.tool_name == "run_sql_query":
+            print(f"SQL QUERY: {elem.tool_args['query']}")
+            print("-"*30)
+            print(elem.result)
+    
+    
+    # TOOL CALLS
+    
+    # tool_calls = response.formatted_tool_calls[::-1]
+    
+    
+    # SQL_AGENT.add
+    # Also print the response as before
+    print("-"*30)
+    print(response.content)
+    
+    
+
+
+# result = run_workflow("Who has the fastest lap time in a ferrari?")
+# print(result)
+
+# run_workflow("Hi")
+# run_workflow("Well, Well, What tables do you have?")
+
+# run_workflow("How many records are there in consturctors championship table?")
+run_workflow("Check the race wins table")
+# if __name__ == "__main__":
+#     # Interactive mode
+#     print("\nEntering interactive mode. Type 'exit' to quit.")
+    
+#     while True:
+#         user_input = input("\nEnter your SQL question: ")
+#         if user_input.lower() == 'exit':
+#             print("Goodbye!")
+#             break
+        
+#         print(f"\n{'='*50}")
+#         print(f"Question: {user_input}")
+#         print(f"{'='*50}")
+        
+#         print("Executing query...")
+        
+#         # Execute the query using the run_workflow function
+#         try:
+#             
+#             print("Query completed. Displaying results:")
+#             print(result)
+#         except Exception as e:
+#             print(f"Error executing query: {e}")
+        
+#         print("="*50)
+
+
+
